@@ -143,6 +143,8 @@ let lastGatewayExit = null;
 let lastDoctorOutput = null;
 let lastDoctorAt = null;
 let startupMaintenance = null;
+let pendingDoctorMarker = null; // { marker, version } to record once the gateway proves healthy
+const GATEWAY_READY_TIMEOUT_MS = Number.parseInt(process.env.OPENCLAW_GATEWAY_READY_TIMEOUT_MS ?? "120000", 10);
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -244,7 +246,8 @@ async function ensureGatewayRunning() {
       try {
         lastGatewayError = null;
         await startGateway();
-        const ready = await waitForGatewayReady({ timeoutMs: 20_000 });
+        // Recent OpenClaw releases can take ~30s+ to bind on Railway (startup admission checks).
+        const ready = await waitForGatewayReady({ timeoutMs: GATEWAY_READY_TIMEOUT_MS });
         if (!ready) {
           throw new Error("Gateway did not become ready in time");
         }
@@ -1536,6 +1539,10 @@ async function runStartupMaintenance() {
     } catch {}
   } else {
     await logSchemaDiagnostics();
+    // If the gateway still starts, the migrations it needs are done; remaining doctor findings
+    // are left for a manual `openclaw doctor --fix`. Avoid re-running doctor (and taking another
+    // full backup) on every restart of the same OpenClaw version.
+    pendingDoctorMarker = { marker, version };
   }
 }
 
@@ -1703,6 +1710,15 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
     try {
       await ensureGatewayRunning();
       console.log("[wrapper] gateway ready");
+      if (pendingDoctorMarker) {
+        try {
+          fs.writeFileSync(pendingDoctorMarker.marker, pendingDoctorMarker.version, "utf8");
+          console.log(
+            `[wrapper] gateway healthy on openclaw ${pendingDoctorMarker.version}; startup doctor will not re-run for this version (some doctor findings remain; run \`openclaw doctor --fix\` manually to review)`,
+          );
+        } catch {}
+        pendingDoctorMarker = null;
+      }
     } catch (err) {
       console.error(`[wrapper] gateway failed to start at boot: ${String(err)}`);
     }
