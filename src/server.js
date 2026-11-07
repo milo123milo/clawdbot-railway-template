@@ -1,6 +1,7 @@
 import childProcess from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
@@ -1319,10 +1320,11 @@ app.post("/setup/import", requireSetupAuth, async (req, res) => {
 });
 
 // Proxy everything else to the gateway.
+// xfwd is off: the wrapper rebuilds forwarded headers itself (see rewriteForwardedHeaders).
 const proxy = httpProxy.createProxyServer({
   target: GATEWAY_TARGET,
   ws: true,
-  xfwd: true,
+  xfwd: false,
 });
 
 proxy.on("error", (err, _req, res) => {
@@ -1374,6 +1376,62 @@ proxy.on("proxyReqWs", (_proxyReq, req) => {
   attachGatewayAuthHeader(req);
 });
 
+// --- Forwarded client attribution ---
+// OpenClaw (2026.11+) rejects proxied requests unless they come from a trusted proxy
+// (gateway.trustedProxies = ["127.0.0.1"], set at boot) AND carry a clean, non-loopback
+// client IP. Drop every client-supplied forwarding header and rebuild them from what
+// Railway's edge reports, so clients cannot spoof their address through the wrapper.
+function parseIp(value) {
+  if (typeof value !== "string") return null;
+  let v = value.trim();
+  if (!v) return null;
+  if (v.startsWith("[") && v.includes("]")) v = v.slice(1, v.indexOf("]"));
+  else if (/^\d{1,3}(\.\d{1,3}){3}:\d+$/.test(v)) v = v.slice(0, v.lastIndexOf(":"));
+  if (v.toLowerCase().startsWith("::ffff:") && v.includes(".")) v = v.slice(7);
+  return net.isIP(v) ? v : null;
+}
+
+function isLoopbackIp(ip) {
+  return ip === "::1" || /^127\./.test(ip);
+}
+
+function firstHeader(value) {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function resolveRealClientIp(req) {
+  // Railway's edge sets X-Real-IP; otherwise use the hop it appended last to X-Forwarded-For.
+  const realIp = parseIp(firstHeader(req.headers["x-real-ip"]));
+  if (realIp && !isLoopbackIp(realIp)) return realIp;
+  const xff = String(firstHeader(req.headers["x-forwarded-for"]) || "")
+    .split(",")
+    .map(parseIp)
+    .filter(Boolean);
+  const lastHop = xff[xff.length - 1];
+  if (lastHop && !isLoopbackIp(lastHop)) return lastHop;
+  const remote = parseIp(req.socket?.remoteAddress);
+  if (remote && !isLoopbackIp(remote)) return remote;
+  return null;
+}
+
+function rewriteForwardedHeaders(req) {
+  const clientIp = resolveRealClientIp(req);
+  const proto = String(firstHeader(req.headers["x-forwarded-proto"]) || "").split(",")[0].trim();
+  const host = firstHeader(req.headers["x-forwarded-host"]) || req.headers.host;
+  for (const name of Object.keys(req.headers)) {
+    const lower = name.toLowerCase();
+    if (lower === "forwarded" || lower === "x-real-ip" || lower.startsWith("x-forwarded-")) {
+      delete req.headers[name];
+    }
+  }
+  // No resolvable external client (e.g. local dev on loopback): send no forwarding headers,
+  // so the gateway treats the request as direct-local.
+  if (!clientIp) return;
+  req.headers["x-forwarded-for"] = clientIp;
+  req.headers["x-forwarded-proto"] = proto === "http" || proto === "https" ? proto : "https";
+  if (host) req.headers["x-forwarded-host"] = String(host);
+}
+
 app.use(requireDashboardAuth, async (req, res) => {
   // If not configured, force users to /setup for any non-setup routes.
   if (!isConfigured() && !req.path.startsWith("/setup")) {
@@ -1397,6 +1455,7 @@ app.use(requireDashboardAuth, async (req, res) => {
   }
 
   attachGatewayAuthHeader(req);
+  rewriteForwardedHeaders(req);
   return proxy.web(req, res, { target: GATEWAY_TARGET });
 });
 
@@ -1683,6 +1742,12 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
       await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "token"]));
       await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]));
       await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.remote.token", OPENCLAW_GATEWAY_TOKEN]));
+      // The wrapper proxies browser traffic from loopback; trust exactly that hop so the
+      // gateway accepts the forwarded client address the wrapper rebuilds.
+      await runCmd(
+        OPENCLAW_NODE,
+        clawArgs(["config", "set", "--json", "gateway.trustedProxies", JSON.stringify(["127.0.0.1"])]),
+      );
       console.log("[wrapper] gateway tokens synced");
     } catch (err) {
       console.warn(`[wrapper] failed to sync gateway tokens: ${String(err)}`);
@@ -1741,6 +1806,7 @@ server.on("upgrade", async (req, socket, head) => {
     return;
   }
   attachGatewayAuthHeader(req);
+  rewriteForwardedHeaders(req);
   proxy.ws(req, socket, head, { target: GATEWAY_TARGET });
 });
 
