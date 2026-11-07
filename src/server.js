@@ -142,6 +142,7 @@ let lastGatewayError = null;
 let lastGatewayExit = null;
 let lastDoctorOutput = null;
 let lastDoctorAt = null;
+let startupMaintenance = null;
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -232,6 +233,11 @@ async function runDoctorBestEffort() {
 
 async function ensureGatewayRunning() {
   if (!isConfigured()) return { ok: false, reason: "not configured" };
+  if (gatewayProc) return { ok: true };
+  // Never start the gateway while startup maintenance (doctor --fix) holds the state dir.
+  if (startupMaintenance) {
+    try { await startupMaintenance; } catch {}
+  }
   if (gatewayProc) return { ok: true };
   if (!gatewayStarting) {
     gatewayStarting = (async () => {
@@ -1391,6 +1397,140 @@ app.use(requireDashboardAuth, async (req, res) => {
   return proxy.web(req, res, { target: GATEWAY_TARGET });
 });
 
+// ---------------------------------------------------------------------------
+// Startup maintenance: backup + `openclaw doctor --fix` once per OpenClaw version.
+// ---------------------------------------------------------------------------
+
+const BACKUP_DIR = process.env.OPENCLAW_BACKUP_DIR?.trim() || path.join(path.dirname(path.resolve(STATE_DIR)), "backups");
+
+function dirSizeBytes(root, skip) {
+  let total = 0;
+  const stack = [root];
+  while (stack.length) {
+    const cur = stack.pop();
+    if (skip && isUnderDir(cur, skip)) continue;
+    let st;
+    try {
+      st = fs.lstatSync(cur);
+    } catch {
+      continue;
+    }
+    if (st.isDirectory()) {
+      let entries = [];
+      try {
+        entries = fs.readdirSync(cur);
+      } catch {
+        continue;
+      }
+      for (const e of entries) stack.push(path.join(cur, e));
+    } else if (st.isFile()) {
+      total += st.size;
+    }
+  }
+  return total;
+}
+
+function freeBytes(p) {
+  try {
+    const s = fs.statfsSync(p);
+    return Number(s.bavail) * Number(s.bsize);
+  } catch {
+    return null;
+  }
+}
+
+async function backupStateDir(label) {
+  const stateAbs = path.resolve(STATE_DIR);
+  const backupAbs = path.resolve(BACKUP_DIR);
+  fs.mkdirSync(backupAbs, { recursive: true });
+
+  const size = dirSizeBytes(stateAbs, backupAbs);
+  const free = freeBytes(backupAbs);
+  // Uncompressed size + headroom: never risk filling the volume while taking a backup.
+  if (free !== null && free < size + 100 * 1024 * 1024) {
+    throw new Error(
+      `not enough free space for a backup (state=${Math.round(size / 1e6)}MB, free=${Math.round(free / 1e6)}MB)`,
+    );
+  }
+
+  const safeLabel = String(label).replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 60);
+  const ts = new Date().toISOString().replace(/[:.]/g, "-");
+  const file = path.join(backupAbs, `state-${safeLabel}-${ts}.tar.gz`);
+  const tmp = `${file}.partial`;
+
+  await tar.c(
+    {
+      gzip: true,
+      portable: true,
+      file: tmp,
+      cwd: path.dirname(stateAbs),
+      filter: (p) => !isUnderDir(path.resolve(path.dirname(stateAbs), p), backupAbs),
+      onwarn: () => {},
+    },
+    [path.basename(stateAbs)],
+  );
+  fs.renameSync(tmp, file);
+
+  // Keep only the newest few automatic backups so repeated boots cannot fill the volume.
+  try {
+    const keep = 3;
+    const old = fs
+      .readdirSync(backupAbs)
+      .filter((n) => n.startsWith("state-pre-doctor-") && n.endsWith(".tar.gz"))
+      .map((n) => ({ n, t: fs.statSync(path.join(backupAbs, n)).mtimeMs }))
+      .sort((a, b) => b.t - a.t)
+      .slice(keep);
+    for (const { n } of old) fs.rmSync(path.join(backupAbs, n), { force: true });
+  } catch {}
+
+  return { file, size };
+}
+
+async function runStartupMaintenance() {
+  if (process.env.OPENCLAW_SKIP_STARTUP_DOCTOR === "1") {
+    console.log("[wrapper] startup doctor disabled via OPENCLAW_SKIP_STARTUP_DOCTOR=1");
+    return;
+  }
+  if (gatewayProc) return; // never run maintenance with a live gateway
+
+  const v = await runCmd(OPENCLAW_NODE, clawArgs(["--version"]), { timeoutMs: 60_000 });
+  const vm = (v.output || "").match(/\b\d{4}\.\d+\.\d+(?:[-.][A-Za-z0-9.]+)?\b/);
+  const version = vm ? vm[0] : "unknown";
+  const marker = path.join(STATE_DIR, ".wrapper-doctor-fix-ok");
+  let done = "";
+  try {
+    done = fs.readFileSync(marker, "utf8").trim();
+  } catch {}
+  if (v.code === 0 && done === version) {
+    console.log(`[wrapper] startup doctor already applied for openclaw ${version}`);
+    return;
+  }
+
+  console.log(`[wrapper] backing up state dir before running doctor --fix (openclaw ${version})...`);
+  try {
+    const b = await backupStateDir(`pre-doctor-${version}`);
+    console.log(`[wrapper] backup written: ${b.file} (state ${Math.round(b.size / 1e6)}MB)`);
+  } catch (err) {
+    // Without a backup we do not mutate state. The gateway may still refuse to start;
+    // run `openclaw doctor --fix` manually after making a backup via /setup/export.
+    console.error(`[wrapper] backup failed; skipping doctor --fix to protect data: ${String(err)}`);
+    return;
+  }
+
+  console.log("[wrapper] running openclaw doctor --fix ...");
+  const fix = await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]), {
+    stdio: ["ignore", "pipe", "pipe"],
+    timeoutMs: 15 * 60 * 1000,
+  });
+  const out = redactSecrets(fix.output || "");
+  console.log(`[wrapper] doctor --fix exit=${fix.code}\n${out.length > 20_000 ? out.slice(-20_000) : out}`);
+  if (fix.code === 0) {
+    try {
+      fs.writeFileSync(marker, version, "utf8");
+    } catch {}
+  }
+}
+
 const server = app.listen(PORT, "0.0.0.0", async () => {
   console.log(`[wrapper] listening on :${PORT}`);
   console.log(`[wrapper] state dir: ${STATE_DIR}`);
@@ -1443,6 +1583,20 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
       console.log("[wrapper] gateway tokens synced");
     } catch (err) {
       console.warn(`[wrapper] failed to sync gateway tokens: ${String(err)}`);
+    }
+  }
+
+  // Newer OpenClaw releases ship state migrations that the gateway refuses to run itself
+  // ("requires stopped-writer maintenance; ... run openclaw doctor --fix"). Run them here,
+  // while the gateway is guaranteed to be stopped, after taking a backup of the state dir.
+  if (isConfigured()) {
+    try {
+      startupMaintenance = runStartupMaintenance();
+      await startupMaintenance;
+    } catch (err) {
+      console.error(`[wrapper] startup maintenance failed (continuing): ${String(err)}`);
+    } finally {
+      startupMaintenance = null;
     }
   }
 
