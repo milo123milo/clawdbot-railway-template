@@ -1517,6 +1517,12 @@ async function runStartupMaintenance() {
     return;
   }
 
+  try {
+    await patchKnownSchemaDrift();
+  } catch (err) {
+    console.error(`[wrapper] schema drift patch failed (continuing): ${String(err)}`);
+  }
+
   console.log("[wrapper] running openclaw doctor --fix ...");
   const fix = await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]), {
     stdio: ["ignore", "pipe", "pipe"],
@@ -1530,6 +1536,50 @@ async function runStartupMaintenance() {
     } catch {}
   } else {
     await logSchemaDiagnostics();
+  }
+}
+
+// Shared-state databases created by pre-release OpenClaw builds (e.g. images built from
+// `main` in Aug 2026) can lack columns that releases added without bumping the schema
+// version. Released doctors refuse such databases ("column definitions differ for ...").
+// Add only the known-missing, nullable columns; this never rewrites or drops data.
+const KNOWN_STATE_COLUMN_DRIFT = {
+  user_profile_identities: [
+    ["canonical_login", "TEXT"],
+    ["authorization_id", "TEXT"],
+    ["authorization_basis_json", "TEXT"],
+  ],
+};
+
+async function patchKnownSchemaDrift() {
+  if (gatewayProc) return; // never touch databases with a live gateway
+  const file = path.join(STATE_DIR, "state", "openclaw.sqlite");
+  if (!fs.existsSync(file)) return;
+  const { DatabaseSync } = await import("node:sqlite");
+  const db = new DatabaseSync(file);
+  try {
+    db.exec("PRAGMA busy_timeout = 10000");
+    const added = [];
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      for (const [table, columns] of Object.entries(KNOWN_STATE_COLUMN_DRIFT)) {
+        const exists = db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?").get(table);
+        if (!exists) continue;
+        const have = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((r) => r.name));
+        for (const [name, type] of columns) {
+          if (have.has(name)) continue;
+          db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${type}`);
+          added.push(`${table}.${name}`);
+        }
+      }
+      db.exec("COMMIT");
+    } catch (err) {
+      db.exec("ROLLBACK");
+      throw err;
+    }
+    if (added.length) console.log(`[wrapper] added missing nullable columns: ${added.join(", ")}`);
+  } finally {
+    db.close();
   }
 }
 
