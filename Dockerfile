@@ -39,7 +39,13 @@ RUN pnpm install --no-frozen-lockfile
 # long time on Railway builders with recent OpenClaw releases.
 RUN OPENCLAW_RUN_NODE_SKIP_DTS_BUILD=1 pnpm build
 ENV OPENCLAW_PREFER_PNPM=1
-RUN pnpm ui:install && pnpm ui:build
+# Newer OpenClaw releases build the Control UI as part of `pnpm build`; rebuilding it in a
+# separate layer fails there (EXDEV renaming dist/control-ui across overlay layers).
+RUN if [ -f dist/control-ui/index.html ]; then \
+      echo "Control UI already built by pnpm build; skipping"; \
+    else \
+      pnpm ui:install && pnpm ui:build; \
+    fi
 
 
 # Runtime image
