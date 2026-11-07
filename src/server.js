@@ -1342,32 +1342,95 @@ proxy.on("error", (err, _req, res) => {
 // --- Dashboard password protection ---
 // Require the same SETUP_PASSWORD for the entire Control UI dashboard,
 // not just the /setup routes.  Healthcheck is excluded so Railway probes work.
+//
+// Newer Control UIs make background requests that cannot carry the browser's Basic
+// credentials: service-worker fetches, and fetches that send the gateway token as
+// `Authorization: Bearer ...` (which replaces the Basic header). Answering those with
+// `WWW-Authenticate` makes the browser re-prompt forever. So, besides Basic auth, accept:
+//   - a signed, HttpOnly session cookie set after a successful Basic login, and
+//   - `Authorization: Bearer <gateway token>` (the same secret the gateway itself checks).
+// The Basic prompt is only offered on page navigations.
+const DASHBOARD_COOKIE = "openclaw_wrapper_auth";
+
+function dashboardCookieValue() {
+  return crypto.createHmac("sha256", SETUP_PASSWORD).update("openclaw-wrapper-dashboard:v1").digest("hex");
+}
+
+function safeEqual(a, b) {
+  const ab = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  return ab.length === bb.length && crypto.timingSafeEqual(ab, bb);
+}
+
+function readCookie(req, name) {
+  for (const part of String(req.headers.cookie || "").split(";")) {
+    const i = part.indexOf("=");
+    if (i > 0 && part.slice(0, i).trim() === name) return part.slice(i + 1).trim();
+  }
+  return null;
+}
+
+function isNavigationRequest(req) {
+  const mode = req.headers["sec-fetch-mode"];
+  if (mode) return mode === "navigate";
+  return String(req.headers.accept || "").includes("text/html");
+}
+
+function rejectDashboard(req, res, message) {
+  if (isNavigationRequest(req)) {
+    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Dashboard"');
+  }
+  return res.status(401).type("text/plain").send(message);
+}
+
 function requireDashboardAuth(req, res, next) {
   if (req.path === "/healthz" || req.path === "/setup/healthz") return next();
   if (req.path.startsWith("/hooks")) return next(); // allow OpenClaw webhook endpoints to bypass dashboard auth
   if (!SETUP_PASSWORD) return next(); // no password configured → open
+
   const header = req.headers.authorization || "";
-  const [scheme, encoded] = header.split(" ");
-  if (scheme !== "Basic" || !encoded) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Dashboard"');
-    return res.status(401).send("Auth required");
+  const spaceIdx = header.indexOf(" ");
+  const scheme = spaceIdx > 0 ? header.slice(0, spaceIdx) : header;
+  const credential = spaceIdx > 0 ? header.slice(spaceIdx + 1).trim() : "";
+
+  if (scheme === "Basic" && credential) {
+    const decoded = Buffer.from(credential, "base64").toString("utf8");
+    const idx = decoded.indexOf(":");
+    const password = idx >= 0 ? decoded.slice(idx + 1) : "";
+    if (!safeEqual(password, SETUP_PASSWORD)) {
+      return rejectDashboard(req, res, "Invalid password");
+    }
+    const secure = String(req.headers["x-forwarded-proto"] || "").startsWith("https") ? "; Secure" : "";
+    res.append(
+      "Set-Cookie",
+      `${DASHBOARD_COOKIE}=${dashboardCookieValue()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000${secure}`,
+    );
+    req.wrapperAuthenticated = true;
+    return next();
   }
-  const decoded = Buffer.from(encoded, "base64").toString("utf8");
-  const idx = decoded.indexOf(":");
-  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
-  if (password !== SETUP_PASSWORD) {
-    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Dashboard"');
-    return res.status(401).send("Invalid password");
+
+  if (scheme === "Bearer" && credential && OPENCLAW_GATEWAY_TOKEN && safeEqual(credential, OPENCLAW_GATEWAY_TOKEN)) {
+    return next(); // forwarded as-is; the gateway validates the same token
   }
-  return next();
+
+  const cookie = readCookie(req, DASHBOARD_COOKIE);
+  if (cookie && safeEqual(cookie, dashboardCookieValue())) {
+    req.wrapperAuthenticated = true;
+    return next();
+  }
+
+  return rejectDashboard(req, res, "Auth required");
 }
 
 // --- Gateway token injection ---
 // The gateway is only reachable from this container. The Control UI in the browser
 // cannot set custom Authorization headers for WebSocket connections, so we inject
-// the token into proxied requests at the wrapper level.
+// the token into proxied requests at the wrapper level. Requests the wrapper itself
+// authenticated (Basic password or session cookie) carry the gateway token instead of
+// the wrapper's own credentials.
 function attachGatewayAuthHeader(req) {
-  if (!req?.headers?.authorization && OPENCLAW_GATEWAY_TOKEN) {
+  if (!OPENCLAW_GATEWAY_TOKEN || !req?.headers) return;
+  if (!req.headers.authorization || req.wrapperAuthenticated || /^Basic\s/i.test(req.headers.authorization)) {
     req.headers.authorization = `Bearer ${OPENCLAW_GATEWAY_TOKEN}`;
   }
 }
