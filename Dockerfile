@@ -34,7 +34,10 @@ RUN set -eux; \
   done
 
 RUN pnpm install --no-frozen-lockfile
-RUN pnpm build
+# Runtime-only build: skip TypeScript declaration (.d.ts) generation, as OpenClaw's own
+# Docker image does. Declaration steps are not needed at runtime and can stall for a very
+# long time on Railway builders with recent OpenClaw releases.
+RUN OPENCLAW_RUN_NODE_SKIP_DTS_BUILD=1 pnpm build
 ENV OPENCLAW_PREFER_PNPM=1
 RUN pnpm ui:install && pnpm ui:build
 
