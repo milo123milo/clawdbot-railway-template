@@ -1471,16 +1471,16 @@ async function backupStateDir(label) {
   );
   fs.renameSync(tmp, file);
 
-  // Keep only the newest few automatic backups so repeated boots cannot fill the volume.
+  // Bound automatic backups so repeated boots cannot fill the volume: always keep the
+  // oldest one (the most pristine pre-upgrade copy) plus the two newest.
   try {
-    const keep = 3;
-    const old = fs
+    const all = fs
       .readdirSync(backupAbs)
       .filter((n) => n.startsWith("state-pre-doctor-") && n.endsWith(".tar.gz"))
       .map((n) => ({ n, t: fs.statSync(path.join(backupAbs, n)).mtimeMs }))
-      .sort((a, b) => b.t - a.t)
-      .slice(keep);
-    for (const { n } of old) fs.rmSync(path.join(backupAbs, n), { force: true });
+      .sort((a, b) => b.t - a.t);
+    const doomed = all.slice(2, -1);
+    for (const { n } of doomed) fs.rmSync(path.join(backupAbs, n), { force: true });
   } catch {}
 
   return { file, size };
@@ -1528,6 +1528,52 @@ async function runStartupMaintenance() {
     try {
       fs.writeFileSync(marker, version, "utf8");
     } catch {}
+  } else {
+    await logSchemaDiagnostics();
+  }
+}
+
+// Read-only diagnostics for failed migrations: prints SQLite schema definitions (DDL and
+// user_version only, never row data) so schema drift can be reproduced offline.
+async function logSchemaDiagnostics() {
+  if (process.env.OPENCLAW_SKIP_SCHEMA_DIAGNOSTICS === "1") return;
+  let DatabaseSync;
+  try {
+    ({ DatabaseSync } = await import("node:sqlite"));
+  } catch (err) {
+    console.log(`[schema-dump] node:sqlite unavailable: ${String(err)}`);
+    return;
+  }
+  const files = [path.join(STATE_DIR, "state", "openclaw.sqlite")];
+  try {
+    for (const agent of fs.readdirSync(path.join(STATE_DIR, "agents"))) {
+      files.push(path.join(STATE_DIR, "agents", agent, "agent", "openclaw-agent.sqlite"));
+    }
+  } catch {}
+  for (const file of files) {
+    if (!fs.existsSync(file)) continue;
+    let db;
+    try {
+      db = new DatabaseSync(file, { readOnly: true });
+      const uv = db.prepare("PRAGMA user_version").get();
+      let meta = null;
+      try {
+        meta = db.prepare("SELECT * FROM schema_meta").all();
+      } catch {}
+      console.log(`[schema-dump] ${file} user_version=${JSON.stringify(uv)} schema_meta=${JSON.stringify(meta)}`);
+      const rows = db
+        .prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY type, name")
+        .all();
+      for (const r of rows) {
+        console.log(`[schema-dump] ${path.basename(path.dirname(path.dirname(file)))} ${JSON.stringify(r)}`);
+      }
+    } catch (err) {
+      console.log(`[schema-dump] ${file} failed: ${String(err)}`);
+    } finally {
+      try {
+        db?.close();
+      } catch {}
+    }
   }
 }
 
